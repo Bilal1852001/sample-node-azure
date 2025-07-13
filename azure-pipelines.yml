@@ -1,0 +1,215 @@
+# Azure DevOps Pipeline for Node.js + React App
+# Deploy to Azure Web App (Linux Container)
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  # Azure Service Connection - Update with your service connection name
+  azureServiceConnectionId: '<AZURE_SERVICE_CONNECTION_ID>'
+  
+  # Azure Web App name - Update with your web app name
+  webAppName: '<AZURE_WEB_APP_NAME>'
+  
+  # Environment name - Update based on your setup
+  environmentName: '<ENVIRONMENT_NAME>'
+  
+  # Project root folder
+  projectRoot: $(System.DefaultWorkingDirectory)
+  
+  # Container registry
+  dockerRegistryServiceConnection: '<DOCKER_REGISTRY_SERVICE_CONNECTION>'
+  imageRepository: 'sample-node-azure'
+  containerRegistry: '<YOUR_CONTAINER_REGISTRY>.azurecr.io'
+  dockerfilePath: '$(projectRoot)/Dockerfile'
+  tag: '$(Build.BuildId)'
+
+stages:
+- stage: Build
+  displayName: Build and Test
+  jobs:
+  - job: Build
+    displayName: Build Job
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: NodeTool@0
+      displayName: 'Install Node.js'
+      inputs:
+        versionSpec: '18.x'
+    
+    - script: |
+        npm ci
+        cd client && npm ci
+      displayName: 'Install dependencies'
+    
+    - script: |
+        npm test
+      displayName: 'Run tests'
+    
+    - script: |
+        npm run build
+      displayName: 'Build application'
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish test results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'coverage/junit.xml'
+        failTaskOnFailedTests: true
+      condition: always()
+    
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish code coverage'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: 'coverage/cobertura-coverage.xml'
+      condition: always()
+    
+    - task: Docker@2
+      displayName: 'Build Docker image'
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)
+        command: 'build'
+        Dockerfile: $(dockerfilePath)
+        tags: |
+          $(tag)
+          latest
+    
+    - task: Docker@2
+      displayName: 'Push Docker image'
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)
+        command: 'push'
+        tags: |
+          $(tag)
+          latest
+    
+    - task: CopyFiles@2
+      displayName: 'Copy deployment files'
+      inputs:
+        Contents: |
+          server/**
+          public/**
+          package*.json
+          Dockerfile
+          .dockerignore
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish build artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: Deploy
+  displayName: Deploy to Azure Web App
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy Job
+    environment: $(environmentName)
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          
+          - task: AzureRmWebAppDeployment@4
+            displayName: 'Deploy to Azure Web App'
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: $(azureServiceConnectionId)
+              appType: 'webAppContainer'
+              WebAppName: $(webAppName)
+              deployToSlotOrASE: false
+              DockerNamespace: $(containerRegistry)
+              DockerRepository: $(imageRepository)
+              DockerImageTag: $(tag)
+              
+          - task: AzureAppServiceManage@0
+            displayName: 'Restart Azure Web App'
+            inputs:
+              azureSubscription: $(azureServiceConnectionId)
+              Action: 'Restart Azure App Service'
+              WebAppName: $(webAppName)
+          
+          - task: AzureAppServiceSettings@1
+            displayName: 'Configure Web App Settings'
+            inputs:
+              azureSubscription: $(azureServiceConnectionId)
+              appName: $(webAppName)
+              resourceGroupName: '<RESOURCE_GROUP_NAME>'
+              appSettings: |
+                [
+                  {
+                    "name": "WEBSITES_ENABLE_APP_SERVICE_STORAGE",
+                    "value": "false",
+                    "slotSetting": false
+                  },
+                  {
+                    "name": "WEBSITES_PORT",
+                    "value": "3000",
+                    "slotSetting": false
+                  },
+                  {
+                    "name": "NODE_ENV",
+                    "value": "production",
+                    "slotSetting": false
+                  }
+                ]
+
+- stage: PostDeploy
+  displayName: Post-deployment Tests
+  dependsOn: Deploy
+  condition: succeeded()
+  
+  jobs:
+  - job: HealthCheck
+    displayName: Health Check
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    - task: PowerShell@2
+      displayName: 'Health Check'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $appUrl = "https://<AZURE_WEB_APP_NAME>.azurewebsites.net"
+          Write-Host "Checking health of: $appUrl/api/health"
+          
+          $maxRetries = 5
+          $retryCount = 0
+          
+          do {
+            try {
+              $response = Invoke-RestMethod -Uri "$appUrl/api/health" -Method Get -TimeoutSec 30
+              Write-Host "Health check passed: $($response.status)"
+              Write-Host "Version: $($response.version)"
+              exit 0
+            }
+            catch {
+              $retryCount++
+              Write-Host "Health check failed (attempt $retryCount of $maxRetries): $($_.Exception.Message)"
+              if ($retryCount -lt $maxRetries) {
+                Start-Sleep -Seconds 30
+              }
+            }
+          } while ($retryCount -lt $maxRetries)
+          
+          Write-Host "Health check failed after $maxRetries attempts"
+          exit 1 
